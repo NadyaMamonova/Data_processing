@@ -1,5 +1,7 @@
 from django.contrib import admin
-from .models import Brand, CarModel, BodyType, Configuration, Car
+
+from .models import BodyType, Brand, Car, CarModel, Configuration
+
 
 admin.site.register(Brand)
 admin.site.register(CarModel)

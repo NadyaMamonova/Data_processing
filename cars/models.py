@@ -1,5 +1,8 @@
+from django.contrib.auth import get_user_model
 from django.db import models
 
+
+User = get_user_model()
 
 class Brand(models.Model):
     name = models.CharField(max_length=100)
@@ -31,3 +34,19 @@ class Statistic(models.Model):
         return f"Статистика от {self.date_calculated}"
 
 
+class AuditLog(models.Model):
+    ACTION_CHOICES = [
+        ('C', 'Created'),
+        ('U', 'Updated'),
+        ('D', 'Deleted')
+    ]
+
+    model_name = models.CharField(max_length=100)
+    object_id = models.PositiveIntegerField()
+    action = models.CharField(max_length=1, choices=ACTION_CHOICES)
+    changes = models.JSONField()
+    user = models.ForeignKey(User, on_delete=models.SET_NULL, null=True)
+    timestamp = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-timestamp']
