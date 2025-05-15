@@ -84,6 +84,8 @@
 
        celery -A cars_project worker --loglevel=info
         celery -A cars_project worker -l info -E
+       celery -A cars_project worker --loglevel=info -I cars_project.tasks
+
 
 3. Celery Beat (для периодических задач)
 
@@ -99,18 +101,23 @@
        python manage.py runserver
 
 📡 API Endpoints
-1. Добавление данных из XML
 
+1. Проверить корневой эндпоинт API:
 
-    POST /cars/add/
+curl http://127.0.0.1:8000/api/
 
-Пример:
+2. Проверить корневой URL:   
 
-    curl -X POST http://127.0.0.1:8000/cars/add/
+curl http://127.0.0.1:8000/
 
-2. Получение статистики
+3. Проверить доступ к приложению cars:
 
-        GET /cars/statistics/
+curl http://127.0.0.1:8000/cars/
+
+4. Получение статистики
+    
+    curl http://127.0.0.1:8000/api/statistics/
+
 
 Пример ответа:
 json
@@ -149,3 +156,86 @@ json
     Swagger UI: http://127.0.0.1:8000/swagger/
 
     ReDoc: http://127.0.0.1:8000/redoc/
+
+
+# Скрипт для запуска Django, Redis и Celery
+
+Этот bash-скрипт автоматизирует запуск:
+
+    Redis (если не запущен)
+
+    Celery Worker (асинхронные задачи)
+
+    Celery Beat (периодические задачи)
+
+    Flower (мониторинг Celery)
+
+    Django development server
+
+Как использовать?
+
+    Убедитесь, что установлены:
+
+        Redis (sudo apt install redis / brew install redis)
+
+        Celery (pip install celery)
+
+        Flower (pip install flower)
+
+Дайте скрипту права на выполнение:
+
+    bash
+    chmod +x run_dev.sh
+
+Запустите скрипт:
+
+    bash
+    ./run_dev.sh
+
+Что делает скрипт?
+
+    Проверяет, запущен ли Redis
+
+    Если нет → запускает redis-server в фоне.
+
+    Останавливает старые процессы Celery (если есть)
+
+        celery worker
+
+        celery beat
+
+        flower
+
+    Запускает компоненты Celery
+
+        Worker (celery -A cars_project worker)
+
+        Beat (celery -A cars_project beat)
+
+        Flower (мониторинг на http://localhost:5555)
+
+    Запускает Django-сервер (python manage.py runserver)
+
+Порт по умолчанию:
+
+    Redis → 6379
+
+    Django → 8000
+
+    Flower → 5555
+
+Если порты заняты → измените их в скрипте.
+Пример вывода при запуске
+
+    bash
+    Starting Redis server...
+    Starting Celery worker...
+    Starting Celery Beat...
+    Starting Flower...
+    Starting Django server...
+
+Как остановить все процессы?
+bash
+
+    pkill -f "celery -A cars_project"
+    pkill -f "redis-server"

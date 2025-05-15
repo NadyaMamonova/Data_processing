@@ -1,128 +1,165 @@
-import datetime
 import logging
 import os
 import re
-
-from django.http import HttpResponse
-from django.utils.decorators import method_decorator
-from django.views import View
-from django.views.decorators.csrf import csrf_exempt
-from rest_framework import status
-from rest_framework.response import Response
-from rest_framework.views import APIView
 from xml.etree.ElementTree import parse
 
+from django.db import close_old_connections, transaction
+from rest_framework import status
+from rest_framework.authentication import BasicAuthentication, SessionAuthentication
+from rest_framework.permissions import AllowAny
+from rest_framework.views import APIView
+
 from .models import BodyType, Brand, Car, CarModel, Statistic
-from .utils.data_processors import StatisticsProcessor
 from .utils.response_utils import create_json_response
 
 
 logger = logging.getLogger(__name__)
 
 
-@method_decorator(csrf_exempt, name='dispatch')
-class AddCarsFromXML(View):
-    def get(self, request):
-        return Response(
-            {"message": "Use POST method to add cars from XML"},
-            status=status.HTTP_405_METHOD_NOT_ALLOWED
-        )
+class CsrfExemptSessionAuthentication(SessionAuthentication):
+    """Отключаем проверку CSRF для API """
+
+    def enforce_csrf(self, request):
+        return
+
+
+class AddCarsFromXML(APIView):
+    """
+    API endpoint for adding cars from XML file
+    """
+    authentication_classes = (CsrfExemptSessionAuthentication, BasicAuthentication)
+    permission_classes = [AllowAny]
 
     def post(self, request):
+        """Handle POST request to import cars from XML"""
+        close_old_connections()
         logger.info("Starting XML import process")
+
         BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         xml_path = os.path.join(BASE_DIR, 'cars_project', 'data', 'Autocatalog.xml')
 
         try:
             tree = parse(xml_path)
-            logger.info("XML file successfully parsed")
+            root = tree.getroot()
         except FileNotFoundError:
-            logger.error("Autocatalog.xml file not found")
-            return HttpResponse("Файл Autocatalog.xml не найден!", status=404)
-        except Exception as e:
-            logger.error(f"Error parsing XML file: {str(e)}")
-            return HttpResponse(f"Ошибка обработки XML: {str(e)}", status=500)
+            logger.error("XML file not found")
+            return create_json_response(
+                status=status.HTTP_400_BAD_REQUEST,
+                message="Файл Autocatalog.xml не найден!"
+            )
 
-        root = tree.getroot()
-        success_count = 0
-        error_count = 0
+        cars_processed = 0
+        errors = 0
+        processed_brands = set()
 
-        for car in root.findall('car'):
+        for modification in root.findall('.//Modification'):
             try:
-                brand_name = car.find('brand').text.strip()
-                model_name = car.find('model').text.strip()
-                body_type = car.find('body_type').text.strip()
+                brand_name = modification.findtext('Make', '').strip()
+                model_name = modification.findtext('Model', '').strip()
+                body_type = modification.findtext('BodyType', '').strip()
 
-                clean_brand_name = re.sub(r'[^A-Za-zА-Яа-я\s]', '', brand_name)
-                clean_model_name = re.sub(r'[^A-Za-zА-Яа-я\d\s]', '', model_name)
+                if not all([brand_name, model_name, body_type]):
+                    continue
 
-                self._save_car_data(clean_brand_name, clean_model_name, body_type)
-                success_count += 1
+                clean_brand_name = re.sub(r'[^\w\s-]', '', brand_name, flags=re.UNICODE)
+                clean_model_name = re.sub(r'[^\w\s-]', '', model_name, flags=re.UNICODE)
+                clean_body_type = re.sub(r'[^\w\s-]', '', body_type, flags=re.UNICODE)
+
+                if self.save_car_data(clean_brand_name, clean_model_name, clean_body_type):
+                    cars_processed += 1
+                    processed_brands.add(clean_brand_name)
+
             except Exception as e:
-                logger.warning(f"Failed to process car entry: {str(e)}")
-                error_count += 1
+                errors += 1
+                logger.error(f"Error processing modification: {str(e)}", exc_info=True)
 
-        logger.info(f"XML import completed. Success: {success_count}, Errors: {error_count}")
-        return HttpResponse(
-            f"Данные успешно добавлены. Успешно: {success_count}, Ошибок: {error_count}",
-            status=200
+        logger.info(f"Import completed. Processed: {cars_processed}, Errors: {errors}")
+        return create_json_response(
+            data={
+                'cars_processed': cars_processed,
+                'errors': errors,
+                'brands_processed': len(processed_brands)
+            },
+            message=f"Успешно обработано {cars_processed} автомобилей"
         )
 
-    def _save_car_data(self, brand_name, model_name, body_type):
+    @transaction.atomic
+    def save_car_data(self, brand_name, model_name, body_type):
         try:
-            brand, created = Brand.objects.get_or_create(name=brand_name)
-            if created:
-                logger.debug(f"Created new brand: {brand_name}")
+            # Проверка существования перед созданием
+            if Car.objects.filter(
+                    model__brand__name__iexact=brand_name,
+                    model__name__iexact=model_name,
+                    body_type__name__iexact=body_type
+            ).exists():
+                return False
 
-            car_model, created = CarModel.objects.get_or_create(
-                brand=brand,
-                name=model_name
-            )
-            if created:
-                logger.debug(f"Created new model: {model_name}")
+            # Сначала пытаемся найти бренд без создания
+            try:
+                brand = Brand.objects.get(name__iexact=brand_name)
+            except Brand.DoesNotExist:
+                brand = Brand.objects.create(name=brand_name)
+                # Дождемся сохранения бренда и получения его ID
+                brand.refresh_from_db()
 
-            body_type_obj, created = BodyType.objects.get_or_create(name=body_type)
-            if created:
-                logger.debug(f"Created new body type: {body_type}")
+            # То же самое для модели автомобиля
+            try:
+                car_model = CarModel.objects.get(brand=brand, name__iexact=model_name)
+            except CarModel.DoesNotExist:
+                car_model = CarModel.objects.create(brand=brand, name=model_name)
+                # Дождемся сохранения модели и получения ее ID
+                car_model.refresh_from_db()
+
+            # И для типа кузова
+            try:
+                body_type_obj = BodyType.objects.get(name__iexact=body_type)
+            except BodyType.DoesNotExist:
+                body_type_obj = BodyType.objects.create(name=body_type)
+                # Дождемся сохранения типа кузова и получения его ID
+                body_type_obj.refresh_from_db()
 
             car = Car.objects.create(model=car_model, body_type=body_type_obj)
-            logger.debug(f"Created car: {brand_name} {model_name} {body_type}")
+            return True
 
         except Exception as e:
-            logger.error(f"Error saving car data: {str(e)}")
+            logger.error(f"Error saving car: {str(e)}")
+            # Перебрасываем исключение для обработки выше
             raise
 
 
 class StatisticsView(APIView):
-    def get(self, request):
-        logger.info("Processing statistics request")
-        try:
-            # Рассчитываем новую статистику при каждом запросе
-            stats_data = StatisticsProcessor.calculate_car_statistics()
-            StatisticsProcessor.save_statistics_to_db(stats_data)
+    """API endpoint for retrieving statistics"""
 
+    def get(self, request):
+        try:
+            stats = {
+                'total_brands': Brand.objects.count(),
+                'total_models': CarModel.objects.count(),
+                'total_cars': Car.objects.count(),
+                'body_type_distribution': {
+                    bt.name: Car.objects.filter(body_type=bt).count()
+                    for bt in BodyType.objects.all()
+                }
+            }
+
+            latest_stat = Statistic.objects.latest('date_calculated')
             return create_json_response({
-                'statistics': stats_data,
-                'date_calculated': datetime.now().isoformat()
+                'statistics': latest_stat.json_statistics,
+                'date_calculated': latest_stat.date_calculated,
+                'current_stats': stats
             })
 
+        except Statistic.DoesNotExist:
+            return create_json_response(
+                status=status.HTTP_404_NOT_FOUND,
+                message="Статистика недоступна"
+            )
         except Exception as e:
-            logger.error(f"Error generating statistics: {str(e)}")
-            # Пытаемся вернуть последние сохраненные данные, если есть
-            try:
-                latest_stat = Statistic.objects.latest('date_calculated')
-                logger.warning("Returning cached statistics due to calculation error")
-                return create_json_response({
-                    'statistics': latest_stat.json_statistics,
-                    'date_calculated': latest_stat.date_calculated,
-                    'warning': 'Current statistics may be outdated'
-                }, status=206)  # 206 Partial Content
-            except Statistic.DoesNotExist:
-                return create_json_response(
-                    None,
-                    status=503,
-                    message=f"Statistics service unavailable: {str(e)}"
-                )
+            logger.error(f"Error fetching statistics: {str(e)}")
+            return create_json_response(
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                message="Ошибка при получении статистики"
+            )
 
 
 class APIRootView(APIView):
@@ -131,7 +168,17 @@ class APIRootView(APIView):
             'add-cars': request.build_absolute_uri('add/'),
             'statistics': request.build_absolute_uri('statistics/'),
             'swagger': request.build_absolute_uri('swagger/'),
-            'redoc': request.build_absolute_uri('redoc/')
+            'redoc': request.build_absolute_uri('redoc/'),
+            'flower': request.build_absolute_uri('flower/')
         }
-        logger.debug(f"API root accessed. Available endpoints: {endpoints}")
-        return Response(endpoints)
+        return create_json_response(data=endpoints)
+
+
+class DuplicateFilter(logging.Filter):
+    def filter(self, record):
+        # Пропускаем дублирующиеся сообщения о существующих автомобилях
+        if "Car exists" in record.msg:
+            return False
+        return True
+
+logger.addFilter(DuplicateFilter())
