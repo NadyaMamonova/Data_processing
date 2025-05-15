@@ -42,8 +42,10 @@ schema_view = get_schema_view(
 
 urlpatterns = [
     path('admin/', admin.site.urls),
+    # API cars
+    path('api/cars/', include('cars.urls')),
+    # Используем тот же cars.urls для пути api/
     path('api/', include('cars.urls')),
-    path('cars/', include('cars.urls')),
 
     # Документация
     path('swagger/', schema_view.with_ui('swagger', cache_timeout=0), name='schema-swagger-ui'),
@@ -55,6 +57,9 @@ urlpatterns = [
         template_name='docs/redoc.html',
         extra_context={'spec_url': '/swagger.json'}
     ), name='docs'),
+
+    # Добавим маршрут для /cars/
+    path('cars/', include('cars.urls')),
 
     # Корневой маршрут
     path('', RedirectView.as_view(url='/swagger/')),

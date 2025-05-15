@@ -2,6 +2,7 @@ import logging
 import os
 import re
 from xml.etree.ElementTree import parse
+from xml.etree import ElementTree as ET
 
 from django.db import close_old_connections, transaction
 from rest_framework import status
@@ -25,107 +26,195 @@ class CsrfExemptSessionAuthentication(SessionAuthentication):
 
 class AddCarsFromXML(APIView):
     """
-    API endpoint for adding cars from XML file
+    API endpoint for adding cars from XML file or JSON data
     """
     authentication_classes = (CsrfExemptSessionAuthentication, BasicAuthentication)
     permission_classes = [AllowAny]
 
-    def post(self, request):
-        """Handle POST request to import cars from XML"""
-        close_old_connections()
-        logger.info("Starting XML import process")
+    # Константы для путей и настроек
+    XML_RELATIVE_PATH = os.path.join('cars_project', 'data', 'Autocatalog.xml')
+    CLEAN_PATTERN = re.compile(r'[^\w\s-]', flags=re.UNICODE)
 
-        BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        xml_path = os.path.join(BASE_DIR, 'cars_project', 'data', 'Autocatalog.xml')
+    def post(self, request):
+        """Handle POST request to import cars from XML or JSON"""
+        close_old_connections()
+        logger.info(f"Received request with data: {request.data}")
 
         try:
-            tree = parse(xml_path)
-            root = tree.getroot()
-        except FileNotFoundError:
-            logger.error("XML file not found")
+            if request.content_type == 'application/json':
+                return self.handle_json_import(request.data)
+            return self.handle_xml_import()
+        except Exception as e:
+            logger.error(f"Unexpected error in post handler: {str(e)}", exc_info=True)
             return create_json_response(
-                status=status.HTTP_400_BAD_REQUEST,
-                message="Файл Autocatalog.xml не найден!"
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                message="Внутренняя ошибка сервера"
             )
 
-        cars_processed = 0
-        errors = 0
-        processed_brands = set()
+    def handle_xml_import(self):
+        """Process XML file import"""
+        logger.info("Starting XML import process")
 
-        for modification in root.findall('.//Modification'):
-            try:
-                brand_name = modification.findtext('Make', '').strip()
-                model_name = modification.findtext('Model', '').strip()
-                body_type = modification.findtext('BodyType', '').strip()
+        try:
+            # Получаем абсолютный путь к XML файлу
+            base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            xml_path = os.path.abspath(os.path.join(base_dir, self.XML_RELATIVE_PATH))
 
-                if not all([brand_name, model_name, body_type]):
-                    continue
+            # Проверяем существование файла перед парсингом
+            if not os.path.exists(xml_path):
+                logger.error(f"XML file not found at: {xml_path}")
+                return create_json_response(
+                    status=status.HTTP_400_BAD_REQUEST,
+                    message="XML файл не найден",
+                    data={"expected_path": xml_path}
+                )
 
-                clean_brand_name = re.sub(r'[^\w\s-]', '', brand_name, flags=re.UNICODE)
-                clean_model_name = re.sub(r'[^\w\s-]', '', model_name, flags=re.UNICODE)
-                clean_body_type = re.sub(r'[^\w\s-]', '', body_type, flags=re.UNICODE)
+            # Парсинг XML
+            tree = parse(xml_path)
+            root = tree.getroot()
 
-                if self.save_car_data(clean_brand_name, clean_model_name, clean_body_type):
-                    cars_processed += 1
-                    processed_brands.add(clean_brand_name)
+            results = {
+                'cars_processed': 0,
+                'errors': 0,
+                'processed_brands': set(),
+                'skipped': 0,
+                'invalid_entries': 0
+            }
 
-            except Exception as e:
-                errors += 1
-                logger.error(f"Error processing modification: {str(e)}", exc_info=True)
+            # Обработка модификаций
+            for modification in root.findall('.//Modification'):
+                try:
+                    brand = modification.findtext('Make', '').strip()
+                    model = modification.findtext('Model', '').strip()
+                    body = modification.findtext('BodyType', '').strip()
 
-        logger.info(f"Import completed. Processed: {cars_processed}, Errors: {errors}")
-        return create_json_response(
-            data={
-                'cars_processed': cars_processed,
-                'errors': errors,
-                'brands_processed': len(processed_brands)
-            },
-            message=f"Успешно обработано {cars_processed} автомобилей"
-        )
+                    # Пропускаем записи с пустыми полями
+                    if not all((brand, model, body)):
+                        results['invalid_entries'] += 1
+                        continue
+
+                    # Очистка данных
+                    clean_data = {
+                        'brand': self._clean_string(brand),
+                        'model': self._clean_string(model),
+                        'body_type': self._clean_string(body)
+                    }
+
+                    # Сохранение в БД
+                    if self.save_car_data(**clean_data):
+                        results['cars_processed'] += 1
+                        results['processed_brands'].add(clean_data['brand'])
+                    else:
+                        results['skipped'] += 1
+
+                except Exception as e:
+                    results['errors'] += 1
+                    logger.error(f"Error processing modification: {str(e)}", exc_info=True)
+
+            logger.info(f"XML import completed. Stats: {results}")
+            return create_json_response(
+                status=status.HTTP_200_OK,
+                data=results,
+                message=f"Обработано {results['cars_processed']} автомобилей"
+            )
+
+        except ET.ParseError as e:
+            logger.error(f"XML parsing error: {str(e)}")
+            return create_json_response(
+                status=status.HTTP_400_BAD_REQUEST,
+                message="Ошибка разбора XML файла"
+            )
+        except Exception as e:
+            logger.error(f"Unexpected error in XML import: {str(e)}", exc_info=True)
+            return create_json_response(
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                message="Внутренняя ошибка при обработке XML"
+            )
+
+    def handle_json_import(self, data):
+        """Process JSON data import"""
+        logger.info("Processing JSON data import")
+
+        required_fields = {'brand', 'model', 'body_type'}
+        missing_fields = required_fields - set(data.keys())
+
+        if missing_fields:
+            return create_json_response(
+                status=status.HTTP_400_BAD_REQUEST,
+                message=f"Отсутствуют обязательные поля: {', '.join(missing_fields)}"
+            )
+
+        try:
+            clean_data = {
+                'brand': self._clean_string(data['brand']),
+                'model': self._clean_string(data['model']),
+                'body_type': self._clean_string(data['body_type'])
+            }
+
+            if not all(clean_data.values()):
+                return create_json_response(
+                    status=status.HTTP_400_BAD_REQUEST,
+                    message="Все поля должны содержать непустые значения"
+                )
+
+            if self.save_car_data(**clean_data):
+                return create_json_response(
+                    status=status.HTTP_201_CREATED,
+                    message=f"Автомобиль {clean_data['brand']} {clean_data['model']} успешно добавлен",
+                    data=clean_data
+                )
+            return create_json_response(
+                status=status.HTTP_200_OK,
+                message="Автомобиль уже существует в базе",
+                data=clean_data
+            )
+
+        except Exception as e:
+            logger.error(f"JSON processing error: {str(e)}", exc_info=True)
+            return create_json_response(
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                message="Ошибка при обработке данных"
+            )
+
+    def _clean_string(self, value):
+        """Clean and normalize string data"""
+        return self.CLEAN_PATTERN.sub('', value.strip()) if value else ''
 
     @transaction.atomic
-    def save_car_data(self, brand_name, model_name, body_type):
+    def save_car_data(self, brand, model, body_type):
+        """Save car data to database (atomic transaction)"""
         try:
-            # Проверка существования перед созданием
             if Car.objects.filter(
-                    model__brand__name__iexact=brand_name,
-                    model__name__iexact=model_name,
+                    model__brand__name__iexact=brand,
+                    model__name__iexact=model,
                     body_type__name__iexact=body_type
             ).exists():
+                logger.debug(f"Car exists: {brand} {model} {body_type}")
                 return False
 
-            # Сначала пытаемся найти бренд без создания
-            try:
-                brand = Brand.objects.get(name__iexact=brand_name)
-            except Brand.DoesNotExist:
-                brand = Brand.objects.create(name=brand_name)
-                # Дождемся сохранения бренда и получения его ID
-                brand.refresh_from_db()
+            brand_obj = Brand.objects.get_or_create(
+                name__iexact=brand,
+                defaults={'name': brand}
+            )[0]
 
-            # То же самое для модели автомобиля
-            try:
-                car_model = CarModel.objects.get(brand=brand, name__iexact=model_name)
-            except CarModel.DoesNotExist:
-                car_model = CarModel.objects.create(brand=brand, name=model_name)
-                # Дождемся сохранения модели и получения ее ID
-                car_model.refresh_from_db()
+            model_obj = CarModel.objects.get_or_create(
+                brand=brand_obj,
+                name__iexact=model,
+                defaults={'name': model}
+            )[0]
 
-            # И для типа кузова
-            try:
-                body_type_obj = BodyType.objects.get(name__iexact=body_type)
-            except BodyType.DoesNotExist:
-                body_type_obj = BodyType.objects.create(name=body_type)
-                # Дождемся сохранения типа кузова и получения его ID
-                body_type_obj.refresh_from_db()
+            body_type_obj = BodyType.objects.get_or_create(
+                name__iexact=body_type,
+                defaults={'name': body_type}
+            )[0]
 
-            car = Car.objects.create(model=car_model, body_type=body_type_obj)
+            Car.objects.create(model=model_obj, body_type=body_type_obj)
+            logger.info(f"Created car: {brand} {model} {body_type}")
             return True
 
         except Exception as e:
-            logger.error(f"Error saving car: {str(e)}")
-            # Перебрасываем исключение для обработки выше
+            logger.error(f"DB save error: {str(e)}", exc_info=True)
             raise
-
 
 class StatisticsView(APIView):
     """API endpoint for retrieving statistics"""
